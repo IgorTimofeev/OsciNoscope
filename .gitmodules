@@ -1,0 +1,3 @@
+[submodule "lib/YOBA"]
+	path = lib/YOBA
+	url = https://github.com/IgorTimofeev/YOBA.git
