@@ -4,6 +4,7 @@
 #include "../lib/YOBA/src/hardware/screen/buffers/monochromeBuffer.h"
 #include "../lib/YOBA/src/resources/fonts/PIXY10Font.h"
 #include "encoder.h"
+#include <driver/adc.h>
 
 using namespace yoba;
 
@@ -21,26 +22,20 @@ Encoder encoder = Encoder(
 	19
 );
 
-const uint8_t analogPin = 0;
-
 MonochromeColor bg = MonochromeColor(false);
 MonochromeColor fg = MonochromeColor(true);
 PIXY10Font font = PIXY10Font();
 
-uint32_t sampleRate = 1000;
 float scaleVoltage = 3.3;
-uint32_t scaleTimeMilliseconds = 5;
+uint32_t scaleTimeMicroseconds = 3200;
 float ADCVoltage = 3.3;
 
 uint32_t renderTime = 0;
 
-enum class DisplayMode {
-	SampleRate,
-	ScaleX,
-	ScaleY
-};
+bool scaleXMode = true;
+bool wasPressed = false;
 
-DisplayMode mode = DisplayMode::SampleRate;
+uint8_t meanADCReadTime = 24;
 
 void setup() {
 	Serial.begin(115200);
@@ -49,10 +44,21 @@ void setup() {
 	pinMode(8, OUTPUT);
 	digitalWrite(8, HIGH);
 
-	// Pwm
-	ledcSetup(0, 1000, 4);
-	ledcAttachPin(1, 0);
-	ledcWrite(0, 8);
+	// ADC
+	adc1_config_width(ADC_WIDTH_BIT_12);
+	adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_12);
+
+	// Calibrating mean ADC read time
+	const uint8_t sampleCount = 255;
+
+	uint64_t time = micros();
+
+	for (int i = 0; i < sampleCount; i++)
+		adc1_get_raw(ADC1_CHANNEL_0);
+
+	meanADCReadTime = (micros() - time) / sampleCount;
+
+	Serial.printf("Mean ADC read time: %d\n", meanADCReadTime);
 
 	// Encoder
 	encoder.setup();
@@ -66,160 +72,177 @@ void loop() {
 	if (encoder.wasInterrupted()) {
 		encoder.acknowledgeInterrupt();
 
+		if (encoder.isPressed() && !wasPressed)
+			scaleXMode = !scaleXMode;
+
+		wasPressed = encoder.isPressed();
+
 		if (abs(encoder.getRotation()) > 3) {
-
 			if (encoder.getRotation() > 0) {
-				sampleRate += 100;
-
-				// Max = 10mHz = 1 microsecond delay
-				if (sampleRate >= 1000000) {
-					sampleRate = 1000000;
+				if (scaleXMode) {
+					scaleTimeMicroseconds = std::min(scaleTimeMicroseconds + 100, 5000000UL);
 				}
 				else {
-					sampleRate += 100;
+					scaleVoltage = std::min(scaleVoltage + 0.1f, 100.f);
 				}
 			}
 			else {
-				// Min = 100 hz
-				if (sampleRate <= 100) {
-					sampleRate = 100;
+				if (scaleXMode) {
+					if (scaleTimeMicroseconds > 200) {
+						scaleTimeMicroseconds -= 100;
+					}
 				}
 				else {
-					sampleRate -= 100;
+					scaleVoltage -= 0.1f;
+
+					if (scaleVoltage < 1)
+						scaleVoltage = 1;
 				}
 			}
-
-			sampleRate += (encoder.getRotation() > 0 ? 1 : -1) * 100;
 
 			encoder.setRotation(0);
-
-			Serial.printf("Rotation, sample rate: %d hz\n", sampleRate);
 		}
 	}
 
-	if (millis() >= renderTime) {
-		const auto& screenSize = screenBuffer.getSize();
-		const auto& chartBounds = Bounds(0, 0, screenSize.getWidth(), screenSize.getHeight());
-		const auto& sideBounds = Bounds(screenSize.getWidth() - 60, 0, 50, screenSize.getHeight());
+	const auto& screenSize = screenBuffer.getSize();
+	const auto& chartBounds = Bounds(0, 0, 80, screenSize.getHeight());
 
-		const uint32_t sampleCount = screenSize.getWidth();
-		const uint64_t sampleDelayNanoSeconds = scaleTimeMilliseconds * 1000000 / sampleRate;
-		uint64_t sampleTimeNanoseconds = 0;
+	const auto& sideBounds = Bounds(
+		Point(chartBounds.getX() + chartBounds.getWidth() + 2, chartBounds.getY()),
+		Size(screenSize.getWidth() - chartBounds.getWidth() - 2, screenSize.getHeight())
+	);
 
-		uint16_t samples[sampleCount];
+	const uint16_t sampleCount = scaleTimeMicroseconds / meanADCReadTime;
+	const double sampleDelay = (double) scaleTimeMicroseconds / sampleCount;
+	double sampleTime = 0;
+	double time;
 
-		for (uint32_t i = 0; i < sampleCount; i++) {
-			const uint64_t timeNanoseconds = micros() * 1000;
+	uint16_t samples[sampleCount];
 
-			if (timeNanoseconds >= sampleTimeNanoseconds) {
-				sampleTimeNanoseconds = timeNanoseconds + sampleDelayNanoSeconds;
-				samples[i] = analogRead(analogPin);
-			}
-			else {
-				asm("nop");
-			}
+	for (auto& sample : samples) {
+		do {
+			time = (double) micros();
 		}
+		while (time < sampleTime);
 
-		screenBuffer.clear(&bg);
-
-		// Axis
-		screenBuffer.renderHorizontalLine(chartBounds.getBottomLeft(), chartBounds.getWidth(), &fg);
-		screenBuffer.renderVerticalLine(chartBounds.getTopLeft(), chartBounds.getHeight(), &fg);
-
-		// Snaps
-		const uint8_t snapCount = 10;
-		const uint16_t snapSize = chartBounds.getWidth() / snapCount;
-
-		for (int32_t snapX = chartBounds.getX() + snapSize; snapX < chartBounds.getX2(); snapX += snapSize) {
-			for (int i = chartBounds.getY(); i < chartBounds.getY2(); i += 2) {
-				screenBuffer.renderPixel(Point(snapX, i), &fg);
-			}
-		}
-
-		// Chart
-		Point previousPoint;
-		Point samplePoint;
-		float sampleVoltage;
-		float minVoltage = ADCVoltage;
-		float maxVoltage = 0;
-
-		for (uint32_t i = 0; i < sampleCount; i++) {
-			sampleVoltage = (float) samples[i] / 4096.f * ADCVoltage;
-
-			if (sampleVoltage < minVoltage)
-				minVoltage = sampleVoltage;
-
-			if (sampleVoltage > maxVoltage)
-				maxVoltage = sampleVoltage;
-
-			samplePoint = Point(
-				chartBounds.getX() + (int32_t) ((float) i / (float) sampleCount * (float) chartBounds.getWidth()),
-				chartBounds.getY() + chartBounds.getHeight() - 1 - (int32_t) (sampleVoltage / scaleVoltage * (float) chartBounds.getHeight())
-			);
-
-			if (i > 0) {
-				screenBuffer.renderLine(
-					previousPoint,
-					samplePoint,
-					&fg
-				);
-			}
-
-			previousPoint = samplePoint;
-		}
-
-		// Side
-		int32_t sideY = sideBounds.getY();
-
-		const uint8_t textBufferLength = 32;
-		wchar_t textBuffer[textBufferLength];
-
-		const auto drawSide = [&]() {
-			const auto& textBounds = Bounds(
-				Point(
-					sideBounds.getX(),
-					sideY
-				),
-				font.getSize(textBuffer)
-			);
-
-			screenBuffer.renderFilledRectangle(textBounds, &bg);
-
-			screenBuffer.renderText(
-				textBounds.getTopLeft(),
-				&font,
-				&fg,
-				textBuffer
-			);
-
-			sideY += textBounds.getHeight() - 1;
-		};
-
-		if (sampleRate < 1000) {
-			swprintf(textBuffer, textBufferLength, L"Ts: %d Hz", sampleRate);
-		}
-		else if (sampleRate < 1000000) {
-			swprintf(textBuffer, textBufferLength, L"Ts: %.1f kHz", (float) sampleRate / 1000.f);
-		}
-		else {
-			swprintf(textBuffer, textBufferLength, L"Ts: %.1f mHz", (float) sampleRate / 1000000.f);
-		}
-
-		drawSide();
-
-		swprintf(textBuffer, textBufferLength, L"Vs: %.1f", scaleVoltage);
-		drawSide();
-
-		swprintf(textBuffer, textBufferLength, L"Vl: %.1f", minVoltage);
-		drawSide();
-
-		swprintf(textBuffer, textBufferLength, L"Vm: %.1f", maxVoltage);
-		drawSide();
-
-		screenBuffer.flush();
-
-		renderTime = millis() + 500;
+		sampleTime = time + sampleDelay;
+		sample = adc1_get_raw(ADC1_CHANNEL_0);
 	}
 
-	delay(16);
+	screenBuffer.clear(&bg);
+
+	// Axis
+//	screenBuffer.renderHorizontalLine(chartBounds.getBottomLeft(), chartBounds.getWidth(), &fg);
+//	screenBuffer.renderVerticalLine(chartBounds.getTopLeft(), chartBounds.getHeight(), &fg);
+
+	// Snaps
+	const uint8_t snapCount = 10;
+	const uint16_t snapSize = chartBounds.getWidth() / snapCount;
+
+	for (int32_t snapX = chartBounds.getX() + snapSize; snapX < chartBounds.getX2(); snapX += snapSize) {
+		for (int32_t snapY = chartBounds.getY2() - snapSize; snapY >= chartBounds.getY(); snapY -= snapSize) {
+			screenBuffer.renderPixel(Point(snapX, snapY), &fg);
+		}
+	}
+
+	// Chart
+	Point previousPoint;
+	float previousVoltage;
+	Point samplePoint;
+	float sampleVoltage;
+	float minVoltage = ADCVoltage;
+	float maxVoltage = 0;
+
+	bool raising = false;
+	uint32_t raisingCount = 0;
+
+	for (uint32_t i = 0; i < sampleCount; i++) {
+		sampleVoltage = (float) samples[i] / 4096.f * ADCVoltage;
+
+		if (sampleVoltage < minVoltage)
+			minVoltage = sampleVoltage;
+
+		if (sampleVoltage > maxVoltage)
+			maxVoltage = sampleVoltage;
+
+		samplePoint = Point(
+			chartBounds.getX() + (int32_t) ((float) i / (float) sampleCount * (float) chartBounds.getWidth()),
+			chartBounds.getY() + chartBounds.getHeight() - 1 - (int32_t) (sampleVoltage / scaleVoltage * (float) chartBounds.getHeight())
+		);
+
+		if (i > 0) {
+			screenBuffer.renderLine(
+				previousPoint,
+				samplePoint,
+				&fg
+			);
+
+			// Raising
+			if (sampleVoltage > previousVoltage) {
+				if (sampleVoltage >= ADCVoltage * 0.9f) {
+					if (raising) {
+						raising = false;
+					}
+					else {
+						raisingCount++;
+						raising = true;
+					}
+				}
+				else {
+					raising = false;
+				}
+			}
+		}
+
+		previousVoltage = sampleVoltage;
+		previousPoint = samplePoint;
+	}
+
+	const float raisingRate = (float) raisingCount * 1000000.f / (float) scaleTimeMicroseconds;
+
+	// Side
+	int32_t sideY = sideBounds.getY();
+
+	const uint8_t textBufferLength = 32;
+	wchar_t textBuffer[textBufferLength];
+
+	const auto drawSide = [&](bool filled) {
+		if (filled)
+			screenBuffer.renderFilledRectangle(Bounds(sideBounds.getX(), sideY, sideBounds.getWidth(), font.getHeight()), 2, &fg);
+
+		screenBuffer.renderText(
+			Point(
+				sideBounds.getX() + 3,
+				sideY
+			),
+			&font,
+			filled ? &bg : &fg,
+			textBuffer
+		);
+
+		sideY += font.getHeight();
+	};
+
+	swprintf(textBuffer, textBufferLength, L"%.1f ms", (float) scaleTimeMicroseconds / 1000.f);
+	drawSide(scaleXMode);
+
+	swprintf(textBuffer, textBufferLength, L"%.1f V", scaleVoltage);
+	drawSide(!scaleXMode);
+
+	sideY += 3;
+	screenBuffer.renderHorizontalLine(Point(sideBounds.getX() + 2, sideY), sideBounds.getWidth() - 2 * 2, &fg);
+	sideY += 3;
+
+	swprintf(textBuffer, textBufferLength, L"%.1f Vmin", minVoltage);
+	drawSide(false);
+
+	swprintf(textBuffer, textBufferLength, L"%.1f Vmax", maxVoltage);
+	drawSide(false);
+
+	swprintf(textBuffer, textBufferLength, L"%.1f kHz", raisingRate / 1000.f, raisingCount);
+	drawSide(false);
+
+	screenBuffer.flush();
+
+	delay(1000 / 24);
 }
