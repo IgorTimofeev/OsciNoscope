@@ -5,8 +5,13 @@
 #include "../lib/YOBA/src/resources/fonts/PIXY10Font.h"
 #include "encoder.h"
 #include <driver/adc.h>
+#include "settings.h"
 
 using namespace yoba;
+
+const float maxADCVoltage = 33.3;
+
+Settings settings = Settings();
 
 ST7565Driver screenDriver = ST7565Driver(
 	7,
@@ -26,120 +31,127 @@ MonochromeColor bg = MonochromeColor(false);
 MonochromeColor fg = MonochromeColor(true);
 PIXY10Font font = PIXY10Font();
 
-float scaleVoltage = 3.3;
-uint32_t scaleTimeMicroseconds = 3200;
-float ADCVoltage = 3.3;
+bool encoderPressed = false;
+uint8_t calibratedADCReadTime = 24;
 
-uint32_t renderTime = 0;
+uint16_t* samples = nullptr;
+uint16_t sampleCount;
+double sampleDelay;
 
-bool scaleXMode = true;
-bool wasPressed = false;
+void reallocateSamples() {
+	delete samples;
+	sampleCount = settings.scaleTimeMicroseconds / calibratedADCReadTime;
+	sampleDelay = (double) settings.scaleTimeMicroseconds / sampleCount;
+	samples = new uint16_t[sampleCount];
+}
 
-uint8_t meanADCReadTime = 24;
-
-void setup() {
-	Serial.begin(115200);
-
-	// Backlight
-	pinMode(8, OUTPUT);
-	digitalWrite(8, HIGH);
-
-	// ADC
-	adc1_config_width(ADC_WIDTH_BIT_12);
-	adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_12);
-
-	// Calibrating mean ADC read time
-	const uint8_t sampleCount = 255;
+void calibrateADCReading() {
+	const uint8_t iterations = 255;
 
 	uint64_t time = micros();
 
-	for (int i = 0; i < sampleCount; i++)
+	for (int i = 0; i < iterations; i++)
 		adc1_get_raw(ADC1_CHANNEL_0);
 
-	meanADCReadTime = (micros() - time) / sampleCount;
-
-	Serial.printf("Mean ADC read time: %d\n", meanADCReadTime);
-
-	// Encoder
-	encoder.setup();
-
-	// Screen
-	screenBuffer.setup();
+	calibratedADCReadTime = (micros() - time) / iterations;
 }
 
-void loop() {
-	// Encoder
-	if (encoder.wasInterrupted()) {
-		encoder.acknowledgeInterrupt();
+void readEncoder() {
+	if (!encoder.wasInterrupted())
+		return;
 
-		if (encoder.isPressed() && !wasPressed)
-			scaleXMode = !scaleXMode;
+	encoder.acknowledgeInterrupt();
 
-		wasPressed = encoder.isPressed();
+	// Mode cycle
+	if (encoder.isPressed() && !encoderPressed) {
+		auto uintMode = (uint8_t) settings.mode;
+		uintMode++;
 
-		if (abs(encoder.getRotation()) > 3) {
-			if (encoder.getRotation() > 0) {
-				if (scaleXMode) {
-					scaleTimeMicroseconds = std::min(scaleTimeMicroseconds + 100, 5000000UL);
-				}
-				else {
-					scaleVoltage = std::min(scaleVoltage + 0.1f, 100.f);
-				}
-			}
-			else {
-				if (scaleXMode) {
-					if (scaleTimeMicroseconds > 200) {
-						scaleTimeMicroseconds -= 100;
-					}
-				}
-				else {
-					scaleVoltage -= 0.1f;
+		if (uintMode > 2)
+			uintMode = 0;
 
-					if (scaleVoltage < 1)
-						scaleVoltage = 1;
-				}
-			}
-
-			encoder.setRotation(0);
-		}
+		settings.mode = (Mode) uintMode;
 	}
 
-	const auto& screenSize = screenBuffer.getSize();
-	const auto& chartBounds = Bounds(0, 0, 80, screenSize.getHeight());
+	encoderPressed = encoder.isPressed();
 
-	const auto& sideBounds = Bounds(
-		Point(chartBounds.getX() + chartBounds.getWidth() + 2, chartBounds.getY()),
-		Size(screenSize.getWidth() - chartBounds.getWidth() - 2, screenSize.getHeight())
-	);
+	// Rotation
+	if (abs(encoder.getRotation()) > 3) {
+		switch (settings.mode) {
+			case Mode::Pause: {
+				settings.samplingEnabled = !settings.samplingEnabled;
+				break;
+			}
+			case Mode::ScaleX: {
+				if (encoder.getRotation() > 0) {
+					settings.scaleTimeMicroseconds = std::min(settings.scaleTimeMicroseconds + 100, 5000000UL);
+				}
+				else {
+					if (settings.scaleTimeMicroseconds > 200) {
+						settings.scaleTimeMicroseconds -= 100;
+					}
+				}
 
-	const uint16_t sampleCount = scaleTimeMicroseconds / meanADCReadTime;
-	const double sampleDelay = (double) scaleTimeMicroseconds / sampleCount;
+				reallocateSamples();
+
+				break;
+			}
+			case Mode::ScaleY: {
+				if (encoder.getRotation() > 0) {
+					settings.scaleVoltage = std::min(settings.scaleVoltage + 0.1f, maxADCVoltage);
+				}
+				else {
+					settings.scaleVoltage -= 0.1f;
+
+					if (settings.scaleVoltage < 0.1)
+						settings.scaleVoltage = 0.1;
+				}
+
+				break;
+			}
+		}
+
+		encoder.setRotation(0);
+	}
+
+	settings.delayWrite();
+}
+
+void readSamples() {
+	if (!settings.samplingEnabled)
+		return;
+
 	double sampleTime = 0;
 	double time;
 
-	uint16_t samples[sampleCount];
-
-	for (auto& sample : samples) {
+	for (int i = 0; i < sampleCount; i++) {
 		do {
 			time = (double) micros();
 		}
 		while (time < sampleTime);
 
 		sampleTime = time + sampleDelay;
-		sample = adc1_get_raw(ADC1_CHANNEL_0);
+		samples[i] = adc1_get_raw(ADC1_CHANNEL_0);
 	}
+}
+
+void render() {
+	const auto& screenSize = screenBuffer.getSize();
+	const auto& chartBounds = Bounds(0, 0, 71, screenSize.getHeight());
+
+	const uint8_t sideMargin = 4;
+
+	const auto& sideBounds = Bounds(
+		Point(chartBounds.getX() + chartBounds.getWidth() + sideMargin, chartBounds.getY()),
+		Size(screenSize.getWidth() - chartBounds.getWidth() - sideMargin, screenSize.getHeight())
+	);
 
 	screenBuffer.clear(&bg);
 
-	// Axis
-//	screenBuffer.renderHorizontalLine(chartBounds.getBottomLeft(), chartBounds.getWidth(), &fg);
-//	screenBuffer.renderVerticalLine(chartBounds.getTopLeft(), chartBounds.getHeight(), &fg);
-
 	// Snaps
-	const uint8_t snapCount = 10;
-	const uint16_t snapSize = chartBounds.getWidth() / snapCount;
+	const uint8_t snapSize = 8;
 
-	for (int32_t snapX = chartBounds.getX() + snapSize; snapX < chartBounds.getX2(); snapX += snapSize) {
+	for (int32_t snapX = chartBounds.getX() + snapSize - 1; snapX <= chartBounds.getX2(); snapX += snapSize) {
 		for (int32_t snapY = chartBounds.getY2() - snapSize; snapY >= chartBounds.getY(); snapY -= snapSize) {
 			screenBuffer.renderPixel(Point(snapX, snapY), &fg);
 		}
@@ -150,14 +162,14 @@ void loop() {
 	float previousVoltage;
 	Point samplePoint;
 	float sampleVoltage;
-	float minVoltage = ADCVoltage;
+	float minVoltage = maxADCVoltage;
 	float maxVoltage = 0;
 
 	bool raising = false;
 	uint32_t raisingCount = 0;
 
 	for (uint32_t i = 0; i < sampleCount; i++) {
-		sampleVoltage = (float) samples[i] / 4096.f * ADCVoltage;
+		sampleVoltage = (float) samples[i] / 4096.f * maxADCVoltage;
 
 		if (sampleVoltage < minVoltage)
 			minVoltage = sampleVoltage;
@@ -167,7 +179,7 @@ void loop() {
 
 		samplePoint = Point(
 			chartBounds.getX() + (int32_t) ((float) i / (float) sampleCount * (float) chartBounds.getWidth()),
-			chartBounds.getY() + chartBounds.getHeight() - 1 - (int32_t) (sampleVoltage / scaleVoltage * (float) chartBounds.getHeight())
+			chartBounds.getY() + chartBounds.getHeight() - 1 - (int32_t) (sampleVoltage / settings.scaleVoltage * (float) chartBounds.getHeight())
 		);
 
 		if (i > 0) {
@@ -179,7 +191,7 @@ void loop() {
 
 			// Raising
 			if (sampleVoltage > previousVoltage) {
-				if (sampleVoltage >= ADCVoltage * 0.9f) {
+				if (sampleVoltage >= maxADCVoltage * 0.9f) {
 					if (raising) {
 						raising = false;
 					}
@@ -198,7 +210,7 @@ void loop() {
 		previousPoint = samplePoint;
 	}
 
-	const float raisingRate = (float) raisingCount * 1000000.f / (float) scaleTimeMicroseconds;
+	const float raisingRate = (float) raisingCount * 1000000.f / (float) settings.scaleTimeMicroseconds;
 
 	// Side
 	int32_t sideY = sideBounds.getY();
@@ -223,26 +235,75 @@ void loop() {
 		sideY += font.getHeight();
 	};
 
-	swprintf(textBuffer, textBufferLength, L"%.1f ms", (float) scaleTimeMicroseconds / 1000.f);
-	drawSide(scaleXMode);
+	wcscpy(textBuffer, settings.samplingEnabled ? L"Scan" : L"Pause");
+	drawSide(settings.mode == Mode::Pause);
 
-	swprintf(textBuffer, textBufferLength, L"%.1f V", scaleVoltage);
-	drawSide(!scaleXMode);
+	if (settings.scaleTimeMicroseconds < 1000) {
+		swprintf(textBuffer, textBufferLength, L"%d us", settings.scaleTimeMicroseconds);
+	}
+	else if (settings.scaleTimeMicroseconds < 1000000) {
+		swprintf(textBuffer, textBufferLength, L"%.1f ms", (float) settings.scaleTimeMicroseconds / 1000.f);
+	}
+	else {
+		swprintf(textBuffer, textBufferLength, L"%.1f s", (float) settings.scaleTimeMicroseconds / 1000000.f);
+	}
+
+	drawSide(settings.mode == Mode::ScaleX);
+
+	swprintf(textBuffer, textBufferLength, L"%.1f V", settings.scaleVoltage);
+	drawSide(settings.mode == Mode::ScaleY);
 
 	sideY += 3;
 	screenBuffer.renderHorizontalLine(Point(sideBounds.getX() + 2, sideY), sideBounds.getWidth() - 2 * 2, &fg);
 	sideY += 3;
 
-	swprintf(textBuffer, textBufferLength, L"%.1f Vmin", minVoltage);
+	swprintf(textBuffer, textBufferLength, L"%.1f-%.1f V", minVoltage, maxVoltage);
 	drawSide(false);
 
-	swprintf(textBuffer, textBufferLength, L"%.1f Vmax", maxVoltage);
-	drawSide(false);
+	if (raisingRate < 1000) {
+		swprintf(textBuffer, textBufferLength, L"%.1f Hz", raisingRate);
+	}
+	else if (raisingRate < 1000000) {
+		swprintf(textBuffer, textBufferLength, L"%.1f kHz", raisingRate / 1000.f);
+	}
+	else {
+		swprintf(textBuffer, textBufferLength, L"%.1f mHz", raisingRate / 1000000.f);
+	}
 
-	swprintf(textBuffer, textBufferLength, L"%.1f kHz", raisingRate / 1000.f, raisingCount);
 	drawSide(false);
 
 	screenBuffer.flush();
+}
+
+void setup() {
+	Serial.begin(115200);
+
+	// Settings
+	settings.read();
+
+	// ADC
+	adc1_config_width(ADC_WIDTH_BIT_12);
+	adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_12);
+	calibrateADCReading();
+
+	// Encoder
+	encoder.setup();
+
+	// Screen backlight
+	pinMode(8, OUTPUT);
+	digitalWrite(8, HIGH);
+
+	// Screen buffer
+	screenBuffer.setup();
+
+	reallocateSamples();
+}
+
+void loop() {
+	readEncoder();
+	readSamples();
+	render();
+	settings.tick();
 
 	delay(1000 / 24);
 }
