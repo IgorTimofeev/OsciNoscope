@@ -22,8 +22,8 @@ ST7565Driver screenDriver = ST7565Driver(
 MonochromeBuffer screenBuffer = MonochromeBuffer(&screenDriver);
 
 Encoder encoder = Encoder(
-	12,
 	18,
+	12,
 	19
 );
 
@@ -165,9 +165,6 @@ void render() {
 	float minVoltage = maxADCVoltage;
 	float maxVoltage = 0;
 
-	bool raising = false;
-	uint32_t raisingCount = 0;
-
 	for (uint32_t i = 0; i < sampleCount; i++) {
 		sampleVoltage = (float) samples[i] / 4096.f * maxADCVoltage;
 
@@ -188,10 +185,22 @@ void render() {
 				samplePoint,
 				&fg
 			);
+		}
 
-			// Raising
+		previousVoltage = sampleVoltage;
+		previousPoint = samplePoint;
+	}
+
+	// Detecting signal frequency
+	bool raising = false;
+	uint32_t raisingCount = 0;
+
+	for (uint32_t i = 0; i < sampleCount; i++) {
+		sampleVoltage = (float) samples[i] / 4096.f * maxADCVoltage;
+
+		if (i > 0) {
 			if (sampleVoltage > previousVoltage) {
-				if (sampleVoltage >= maxADCVoltage * 0.9f) {
+				if (sampleVoltage >= maxVoltage * 0.9f) {
 					if (raising) {
 						raising = false;
 					}
@@ -207,7 +216,6 @@ void render() {
 		}
 
 		previousVoltage = sampleVoltage;
-		previousPoint = samplePoint;
 	}
 
 	const float raisingRate = (float) raisingCount * 1000000.f / (float) settings.scaleTimeMicroseconds;
