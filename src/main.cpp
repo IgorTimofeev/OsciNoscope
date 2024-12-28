@@ -31,18 +31,30 @@ MonochromeColor bg = MonochromeColor(false);
 MonochromeColor fg = MonochromeColor(true);
 PIXY10Font font = PIXY10Font();
 
+bool samplingEnabled = true;
 bool encoderPressed = false;
 uint8_t calibratedADCReadTime = 24;
 
 uint16_t* samples = nullptr;
 uint16_t sampleCount;
-double sampleDelay;
+uint32_t renderTime = 0;
+uint32_t selectedModeBlinkTime = 0;
+bool selectedModeBlink = true;
+
+void allocateSamples() {
+	sampleCount = settings.scaleTimeMicroseconds / calibratedADCReadTime;
+	samples = new uint16_t[sampleCount];
+	memset(samples, 0, sampleCount * sizeof(uint16_t));
+}
 
 void reallocateSamples() {
-	delete samples;
-	sampleCount = settings.scaleTimeMicroseconds / calibratedADCReadTime;
-	sampleDelay = (double) settings.scaleTimeMicroseconds / sampleCount;
-	samples = new uint16_t[sampleCount];
+	const auto oldSamples = samples;
+	const auto oldSampleCount = sampleCount;
+
+	allocateSamples();
+
+	memcpy(samples, oldSamples, std::min(sampleCount, oldSampleCount) * sizeof(uint16_t));
+	delete oldSamples;
 }
 
 void calibrateADCReading() {
@@ -56,71 +68,11 @@ void calibrateADCReading() {
 	calibratedADCReadTime = (micros() - time) / iterations;
 }
 
-void readEncoder() {
-	if (!encoder.wasInterrupted())
-		return;
-
-	encoder.acknowledgeInterrupt();
-
-	// Mode cycle
-	if (encoder.isPressed() && !encoderPressed) {
-		auto uintMode = (uint8_t) settings.mode;
-		uintMode++;
-
-		if (uintMode > 2)
-			uintMode = 0;
-
-		settings.mode = (Mode) uintMode;
-	}
-
-	encoderPressed = encoder.isPressed();
-
-	// Rotation
-	if (abs(encoder.getRotation()) > 3) {
-		switch (settings.mode) {
-			case Mode::Pause: {
-				settings.samplingEnabled = !settings.samplingEnabled;
-				break;
-			}
-			case Mode::ScaleX: {
-				if (encoder.getRotation() > 0) {
-					settings.scaleTimeMicroseconds = std::min(settings.scaleTimeMicroseconds + 100, 5000000UL);
-				}
-				else {
-					if (settings.scaleTimeMicroseconds > 200) {
-						settings.scaleTimeMicroseconds -= 100;
-					}
-				}
-
-				reallocateSamples();
-
-				break;
-			}
-			case Mode::ScaleY: {
-				if (encoder.getRotation() > 0) {
-					settings.scaleVoltage = std::min(settings.scaleVoltage + 0.1f, maxADCVoltage);
-				}
-				else {
-					settings.scaleVoltage -= 0.1f;
-
-					if (settings.scaleVoltage < 0.1)
-						settings.scaleVoltage = 0.1;
-				}
-
-				break;
-			}
-		}
-
-		encoder.setRotation(0);
-	}
-
-	settings.delayWrite();
-}
-
 void readSamples() {
-	if (!settings.samplingEnabled)
+	if (!samplingEnabled)
 		return;
 
+	const auto sampleDelay = (double) settings.scaleTimeMicroseconds / sampleCount;
 	double sampleTime = 0;
 	double time;
 
@@ -135,11 +87,108 @@ void readSamples() {
 	}
 }
 
-void render() {
-	const auto& screenSize = screenBuffer.getSize();
-	const auto& chartBounds = Bounds(0, 0, 71, screenSize.getHeight());
+void updateSelectedModeBlinkTime() {
+	selectedModeBlinkTime = millis() + 500;
+}
 
-	const uint8_t sideMargin = 4;
+void readEncoder() {
+	if (!encoder.wasInterrupted())
+		return;
+
+	encoder.acknowledgeInterrupt();
+
+	// Toggling mode selection
+	if (encoder.isPressed() && !encoderPressed) {
+		settings.modeSelected = !settings.modeSelected;
+
+		selectedModeBlink = true;
+		updateSelectedModeBlinkTime();
+	}
+
+	encoderPressed = encoder.isPressed();
+
+	// Rotation
+	if (abs(encoder.getRotation()) > 3) {
+		if (settings.modeSelected) {
+			switch (settings.mode) {
+				case Mode::Pause: {
+					samplingEnabled = !samplingEnabled;
+					break;
+				}
+				case Mode::ScaleX: {
+					if (encoder.getRotation() > 0) {
+						settings.scaleTimeMicroseconds = std::min(settings.scaleTimeMicroseconds + 100, 5000000UL);
+					}
+					else {
+						if (settings.scaleTimeMicroseconds > 200) {
+							settings.scaleTimeMicroseconds -= 100;
+						}
+					}
+
+					reallocateSamples();
+
+					break;
+				}
+				case Mode::ScaleY: {
+					if (encoder.getRotation() > 0) {
+						settings.scaleVoltage = std::min(settings.scaleVoltage + 0.1f, maxADCVoltage);
+					}
+					else {
+						settings.scaleVoltage -= 0.1f;
+
+						if (settings.scaleVoltage < 0.1)
+							settings.scaleVoltage = 0.1;
+					}
+
+					break;
+				}
+			}
+		}
+		// Cycling between modes
+		else {
+			auto uintMode = (uint8_t) settings.mode;
+
+//			if (encoder.getRotation() > 0) {
+//				uintMode++;
+//
+//				if (uintMode > (uint8_t) Mode::Last)
+//					uintMode = 0;
+//			}
+//			else {
+//				if (uintMode > 0) {
+//					uintMode--;
+//				}
+//				else {
+//					uintMode = (uint8_t) Mode::Last;
+//				}
+//			}
+
+			if (encoder.getRotation() > 0) {
+				if (uintMode < (uint8_t) Mode::Last)
+					uintMode++;
+			}
+			else {
+				if (uintMode > 0)
+					uintMode--;
+			}
+
+			settings.mode = (Mode) uintMode;
+		}
+
+		encoder.setRotation(0);
+	}
+
+	settings.delayWrite();
+}
+
+void render() {
+	if (millis() < renderTime)
+		return;
+
+	const auto& screenSize = screenBuffer.getSize();
+	const auto& chartBounds = Bounds(0, 0, 72, screenSize.getHeight());
+
+	const uint8_t sideMargin = 6;
 
 	const auto& sideBounds = Bounds(
 		Point(chartBounds.getX() + chartBounds.getWidth() + sideMargin, chartBounds.getY()),
@@ -149,11 +198,20 @@ void render() {
 	screenBuffer.clear(&bg);
 
 	// Snaps
-	const uint8_t snapSize = 8;
+	const uint8_t snapXCount = 10;
+	const uint8_t snapYCount = 10;
+	const auto snapXSize = (float) chartBounds.getWidth() / snapXCount;
+	const auto snapYSize = (float) chartBounds.getHeight() / snapYCount;
 
-	for (int32_t snapX = chartBounds.getX() + snapSize - 1; snapX <= chartBounds.getX2(); snapX += snapSize) {
-		for (int32_t snapY = chartBounds.getY2() - snapSize; snapY >= chartBounds.getY(); snapY -= snapSize) {
-			screenBuffer.renderPixel(Point(snapX, snapY), &fg);
+	for (uint8_t snapY = 1; snapY <= snapYCount; snapY++) {
+		for (uint8_t snapX = 1; snapX <= snapXCount; snapX++) {
+			screenBuffer.renderPixel(
+				Point(
+					(int32_t) ((float) chartBounds.getX() - 1 + (float) snapX * snapXSize),
+					(int32_t) ((float) chartBounds.getY2() - 1 - (float) snapY * snapYSize)
+				),
+				&fg
+			);
 		}
 	}
 
@@ -226,25 +284,50 @@ void render() {
 	const uint8_t textBufferLength = 32;
 	wchar_t textBuffer[textBufferLength];
 
-	const auto drawSide = [&](bool filled) {
-		if (filled)
-			screenBuffer.renderFilledRectangle(Bounds(sideBounds.getX(), sideY, sideBounds.getWidth(), font.getHeight()), 2, &fg);
+	const auto drawSideText = [&](bool alt = false) {
+		const uint8_t textMargin = 4;
 
 		screenBuffer.renderText(
 			Point(
-				sideBounds.getX() + 3,
+				sideBounds.getX() + textMargin,
 				sideY
 			),
 			&font,
-			filled ? &bg : &fg,
+			alt ? &bg : &fg,
 			textBuffer
 		);
 
 		sideY += font.getHeight();
 	};
 
-	wcscpy(textBuffer, settings.samplingEnabled ? L"Scan" : L"Pause");
-	drawSide(settings.mode == Mode::Pause);
+	const auto drawSide = [&](Mode mode) {
+		if (settings.mode == mode) {
+			if (selectedModeBlink) {
+				screenBuffer.renderFilledRectangle(Bounds(sideBounds.getX(), sideY, sideBounds.getWidth(), font.getHeight()), 2, &fg);
+			}
+			else {
+				const uint8_t margin = 1;
+
+				screenBuffer.renderFilledRectangle(
+					Bounds(
+						sideBounds.getX() + margin,
+						sideY + margin, sideBounds.getWidth() - margin * 2,
+						font.getHeight() - margin * 2
+					),
+					2,
+					&fg
+				);
+			}
+
+			drawSideText(true);
+		}
+		else {
+			drawSideText(false);
+		}
+	};
+
+	wcscpy(textBuffer, samplingEnabled ? L"Scan" : L"Pause");
+	drawSide(Mode::Pause);
 
 	if (settings.scaleTimeMicroseconds < 1000) {
 		swprintf(textBuffer, textBufferLength, L"%d us", settings.scaleTimeMicroseconds);
@@ -256,17 +339,15 @@ void render() {
 		swprintf(textBuffer, textBufferLength, L"%.1f s", (float) settings.scaleTimeMicroseconds / 1000000.f);
 	}
 
-	drawSide(settings.mode == Mode::ScaleX);
+	drawSide(Mode::ScaleX);
 
 	swprintf(textBuffer, textBufferLength, L"%.1f V", settings.scaleVoltage);
-	drawSide(settings.mode == Mode::ScaleY);
+	drawSide(Mode::ScaleY);
 
-	sideY += 3;
-	screenBuffer.renderHorizontalLine(Point(sideBounds.getX() + 2, sideY), sideBounds.getWidth() - 2 * 2, &fg);
-	sideY += 3;
+	sideY += 5;
 
 	swprintf(textBuffer, textBufferLength, L"%.1f-%.1f V", minVoltage, maxVoltage);
-	drawSide(false);
+	drawSideText();
 
 	if (raisingRate < 1000) {
 		swprintf(textBuffer, textBufferLength, L"%.1f Hz", raisingRate);
@@ -278,9 +359,16 @@ void render() {
 		swprintf(textBuffer, textBufferLength, L"%.1f mHz", raisingRate / 1000000.f);
 	}
 
-	drawSide(false);
+	drawSideText();
 
 	screenBuffer.flush();
+
+	if (settings.modeSelected && millis() >= selectedModeBlinkTime) {
+		selectedModeBlink = !selectedModeBlink;
+		updateSelectedModeBlinkTime();
+	}
+
+	renderTime = millis() + 1000 / 30;
 }
 
 void setup() {
@@ -304,7 +392,7 @@ void setup() {
 	// Screen buffer
 	screenBuffer.setup();
 
-	reallocateSamples();
+	allocateSamples();
 }
 
 void loop() {
@@ -313,5 +401,5 @@ void loop() {
 	render();
 	settings.tick();
 
-	delay(1000 / 24);
+	delay(1);
 }

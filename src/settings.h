@@ -5,16 +5,18 @@
 enum class Mode : uint8_t {
 	Pause,
 	ScaleX,
-	ScaleY
+	ScaleY,
+
+	Last = ScaleY,
 };
 
 #pragma pack(push, 1)
 class Settings {
 	public:
 		Mode mode = Mode::Pause;
+		bool modeSelected = false;
 		float scaleVoltage = 3.3f;
-		uint32_t scaleTimeMicroseconds = 5000;
-		bool samplingEnabled = true;
+		uint32_t scaleTimeMicroseconds = 1000;
 
 		void read() {
 			Serial.println("Reading settings");
@@ -46,7 +48,7 @@ class Settings {
 		}
 
 	private:
-		static const uint8_t _writtenFlag = 0xAB;
+		static const uint8_t _writtenFlag = 0xAD;
 		uint32_t _writeTime = 0;
 
 };
