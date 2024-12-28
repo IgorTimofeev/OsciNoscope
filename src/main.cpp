@@ -3,13 +3,14 @@
 #include "../lib/YOBA/src/hardware/screen/drivers/ST7565Driver.h"
 #include "../lib/YOBA/src/hardware/screen/buffers/monochromeBuffer.h"
 #include "../lib/YOBA/src/resources/fonts/PIXY10Font.h"
+#include "../lib/YOBA/src/number.h"
 #include "encoder.h"
 #include <driver/adc.h>
 #include "settings.h"
 
 using namespace yoba;
 
-const float maxADCVoltage = 33.3;
+const uint32_t maxADCVoltage = 33300;
 
 Settings settings = Settings();
 
@@ -34,15 +35,18 @@ PIXY10Font font = PIXY10Font();
 bool samplingEnabled = true;
 bool encoderPressed = false;
 uint8_t calibratedADCReadTime = 24;
+uint32_t samplingTime = 0;
 
 uint16_t* samples = nullptr;
 uint16_t sampleCount;
 uint32_t renderTime = 0;
-uint32_t selectedModeBlinkTime = 0;
-bool selectedModeBlink = true;
+
+bool modeSelected = false;
+bool modeSelectedBlink = true;
+uint32_t modeSelectedBlinkTime = 0;
 
 void allocateSamples() {
-	sampleCount = settings.scaleTimeMicroseconds / calibratedADCReadTime;
+	sampleCount = settings.scaleTimeMicros / calibratedADCReadTime;
 	samples = new uint16_t[sampleCount];
 	memset(samples, 0, sampleCount * sizeof(uint16_t));
 }
@@ -69,10 +73,10 @@ void calibrateADCReading() {
 }
 
 void readSamples() {
-	if (!samplingEnabled)
+	if (!samplingEnabled || millis() < samplingTime)
 		return;
 
-	const auto sampleDelay = (double) settings.scaleTimeMicroseconds / sampleCount;
+	const auto sampleDelay = (double) settings.scaleTimeMicros / sampleCount;
 	double sampleTime = 0;
 	double time;
 
@@ -85,10 +89,12 @@ void readSamples() {
 		sampleTime = time + sampleDelay;
 		samples[i] = adc1_get_raw(ADC1_CHANNEL_0);
 	}
+
+	samplingTime = millis() + 1000 / 20;
 }
 
 void updateSelectedModeBlinkTime() {
-	selectedModeBlinkTime = millis() + 500;
+	modeSelectedBlinkTime = millis() + 250;
 }
 
 void readEncoder() {
@@ -99,9 +105,9 @@ void readEncoder() {
 
 	// Toggling mode selection
 	if (encoder.isPressed() && !encoderPressed) {
-		settings.modeSelected = !settings.modeSelected;
+		modeSelected = !modeSelected;
 
-		selectedModeBlink = true;
+		modeSelectedBlink = true;
 		updateSelectedModeBlinkTime();
 	}
 
@@ -109,7 +115,7 @@ void readEncoder() {
 
 	// Rotation
 	if (abs(encoder.getRotation()) > 3) {
-		if (settings.modeSelected) {
+		if (modeSelected) {
 			switch (settings.mode) {
 				case Mode::Pause: {
 					samplingEnabled = !samplingEnabled;
@@ -117,11 +123,11 @@ void readEncoder() {
 				}
 				case Mode::ScaleX: {
 					if (encoder.getRotation() > 0) {
-						settings.scaleTimeMicroseconds = std::min(settings.scaleTimeMicroseconds + 100, 5000000UL);
+						settings.scaleTimeMicros = std::min(settings.scaleTimeMicros + 100, 5000000UL);
 					}
 					else {
-						if (settings.scaleTimeMicroseconds > 200) {
-							settings.scaleTimeMicroseconds -= 100;
+						if (settings.scaleTimeMicros > 100) {
+							settings.scaleTimeMicros -= 100;
 						}
 					}
 
@@ -131,13 +137,31 @@ void readEncoder() {
 				}
 				case Mode::ScaleY: {
 					if (encoder.getRotation() > 0) {
-						settings.scaleVoltage = std::min(settings.scaleVoltage + 0.1f, maxADCVoltage);
+						if (settings.scaleVoltageMillis < 500) {
+							settings.scaleVoltageMillis += 10;
+						}
+						else if (settings.scaleVoltageMillis < 10000) {
+							settings.scaleVoltageMillis += 100;
+						}
+						else {
+							settings.scaleVoltageMillis += 1000;
+						}
+
+						if (settings.scaleVoltageMillis > maxADCVoltage)
+							settings.scaleVoltageMillis = maxADCVoltage;
 					}
 					else {
-						settings.scaleVoltage -= 0.1f;
-
-						if (settings.scaleVoltage < 0.1)
-							settings.scaleVoltage = 0.1;
+						if (settings.scaleVoltageMillis <= 500) {
+							if (settings.scaleVoltageMillis > 10)
+								settings.scaleVoltageMillis -= 10;
+						}
+						else if (settings.scaleVoltageMillis <= 10000) {
+							settings.scaleVoltageMillis -= 100;
+						}
+						else {
+							if (settings.scaleVoltageMillis > 1000)
+								settings.scaleVoltageMillis -= 1000;
+						}
 					}
 
 					break;
@@ -147,21 +171,6 @@ void readEncoder() {
 		// Cycling between modes
 		else {
 			auto uintMode = (uint8_t) settings.mode;
-
-//			if (encoder.getRotation() > 0) {
-//				uintMode++;
-//
-//				if (uintMode > (uint8_t) Mode::Last)
-//					uintMode = 0;
-//			}
-//			else {
-//				if (uintMode > 0) {
-//					uintMode--;
-//				}
-//				else {
-//					uintMode = (uint8_t) Mode::Last;
-//				}
-//			}
 
 			if (encoder.getRotation() > 0) {
 				if (uintMode < (uint8_t) Mode::Last)
@@ -217,14 +226,15 @@ void render() {
 
 	// Chart
 	Point previousPoint;
-	float previousVoltage;
 	Point samplePoint;
-	float sampleVoltage;
-	float minVoltage = maxADCVoltage;
-	float maxVoltage = 0;
+
+	uint32_t sampleVoltage;
+	uint32_t minVoltage = maxADCVoltage;
+	uint32_t maxVoltage = 0;
+	uint32_t previousVoltage;
 
 	for (uint32_t i = 0; i < sampleCount; i++) {
-		sampleVoltage = (float) samples[i] / 4096.f * maxADCVoltage;
+		sampleVoltage = samples[i] * maxADCVoltage / 4096;
 
 		if (sampleVoltage < minVoltage)
 			minVoltage = sampleVoltage;
@@ -234,7 +244,7 @@ void render() {
 
 		samplePoint = Point(
 			chartBounds.getX() + (int32_t) ((float) i / (float) sampleCount * (float) chartBounds.getWidth()),
-			chartBounds.getY() + chartBounds.getHeight() - 1 - (int32_t) (sampleVoltage / settings.scaleVoltage * (float) chartBounds.getHeight())
+			chartBounds.getY() + chartBounds.getHeight() - 1 - (int32_t) (sampleVoltage * chartBounds.getHeight() / settings.scaleVoltageMillis)
 		);
 
 		if (i > 0) {
@@ -254,11 +264,11 @@ void render() {
 	uint32_t raisingCount = 0;
 
 	for (uint32_t i = 0; i < sampleCount; i++) {
-		sampleVoltage = (float) samples[i] / 4096.f * maxADCVoltage;
+		sampleVoltage = samples[i] * maxADCVoltage / 4096;
 
 		if (i > 0) {
 			if (sampleVoltage > previousVoltage) {
-				if (sampleVoltage >= maxVoltage * 0.9f) {
+				if (sampleVoltage >= (uint32_t) ((float) maxVoltage * 0.9f)) {
 					if (raising) {
 						raising = false;
 					}
@@ -276,7 +286,7 @@ void render() {
 		previousVoltage = sampleVoltage;
 	}
 
-	const float raisingRate = (float) raisingCount * 1000000.f / (float) settings.scaleTimeMicroseconds;
+	const float raisingRate = (float) raisingCount * 1000000.f / (float) settings.scaleTimeMicros;
 
 	// Side
 	int32_t sideY = sideBounds.getY();
@@ -302,7 +312,7 @@ void render() {
 
 	const auto drawSide = [&](Mode mode) {
 		if (settings.mode == mode) {
-			if (selectedModeBlink) {
+			if (modeSelectedBlink) {
 				screenBuffer.renderFilledRectangle(Bounds(sideBounds.getX(), sideY, sideBounds.getWidth(), font.getHeight()), 2, &fg);
 			}
 			else {
@@ -326,29 +336,46 @@ void render() {
 		}
 	};
 
+	// Scan/pause
 	wcscpy(textBuffer, samplingEnabled ? L"Scan" : L"Pause");
 	drawSide(Mode::Pause);
 
-	if (settings.scaleTimeMicroseconds < 1000) {
-		swprintf(textBuffer, textBufferLength, L"%d us", settings.scaleTimeMicroseconds);
+	// Scale time
+	if (settings.scaleTimeMicros < 1000) {
+		swprintf(textBuffer, textBufferLength, L"%d us", settings.scaleTimeMicros);
 	}
-	else if (settings.scaleTimeMicroseconds < 1000000) {
-		swprintf(textBuffer, textBufferLength, L"%.1f ms", (float) settings.scaleTimeMicroseconds / 1000.f);
+	else if (settings.scaleTimeMicros < 1000000) {
+		swprintf(textBuffer, textBufferLength, L"%.1f ms", (float) settings.scaleTimeMicros / 1000.f);
 	}
 	else {
-		swprintf(textBuffer, textBufferLength, L"%.1f s", (float) settings.scaleTimeMicroseconds / 1000000.f);
+		swprintf(textBuffer, textBufferLength, L"%.1f s", (float) settings.scaleTimeMicros / 1000000.f);
 	}
 
 	drawSide(Mode::ScaleX);
 
-	swprintf(textBuffer, textBufferLength, L"%.1f V", settings.scaleVoltage);
+	// Scale voltage
+	if (settings.scaleVoltageMillis < 1000) {
+		swprintf(textBuffer, textBufferLength, L"%d mV", settings.scaleVoltageMillis);
+	}
+	else {
+		swprintf(textBuffer, textBufferLength, L"%.1f V", (float) settings.scaleVoltageMillis / 1000.f);
+	}
+
 	drawSide(Mode::ScaleY);
 
 	sideY += 5;
 
-	swprintf(textBuffer, textBufferLength, L"%.1f-%.1f V", minVoltage, maxVoltage);
+	// Min-max
+	if (settings.scaleVoltageMillis < 1000) {
+		swprintf(textBuffer, textBufferLength, L"%d-%d mV", minVoltage, maxVoltage);
+	}
+	else {
+		swprintf(textBuffer, textBufferLength, L"%.1f-%.1f V", (float) minVoltage / 1000.f, (float) maxVoltage / 1000.f);
+	}
+
 	drawSideText();
 
+	// Frequency
 	if (raisingRate < 1000) {
 		swprintf(textBuffer, textBufferLength, L"%.1f Hz", raisingRate);
 	}
@@ -363,8 +390,8 @@ void render() {
 
 	screenBuffer.flush();
 
-	if (settings.modeSelected && millis() >= selectedModeBlinkTime) {
-		selectedModeBlink = !selectedModeBlink;
+	if (modeSelected && millis() >= modeSelectedBlinkTime) {
+		modeSelectedBlink = !modeSelectedBlink;
 		updateSelectedModeBlinkTime();
 	}
 

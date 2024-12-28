@@ -14,9 +14,8 @@ enum class Mode : uint8_t {
 class Settings {
 	public:
 		Mode mode = Mode::Pause;
-		bool modeSelected = false;
-		float scaleVoltage = 3.3f;
-		uint32_t scaleTimeMicroseconds = 1000;
+		uint32_t scaleVoltageMillis = 3300;
+		uint32_t scaleTimeMicros = 1000;
 
 		void read() {
 			Serial.println("Reading settings");
@@ -48,7 +47,7 @@ class Settings {
 		}
 
 	private:
-		static const uint8_t _writtenFlag = 0xAD;
+		static const uint8_t _writtenFlag = 0xAB;
 		uint32_t _writeTime = 0;
 
 };
